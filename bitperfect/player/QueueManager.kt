@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-class QueueManager {
+object QueueManager {
 
     // Original, unmutated queue
     private var originalQueue: List<SongEntity> = emptyList()
@@ -30,10 +30,6 @@ class QueueManager {
     private val _repeatMode = MutableStateFlow(RepeatMode.OFF)
     val repeatMode: StateFlow<RepeatMode> = _repeatMode.asStateFlow()
 
-    /**
-     * Sets the playback queue with a list of songs and plays the song at startIndex.
-     * Preserves originalQueue unmutated and builds shuffled index mapping.
-     */
     fun setQueue(songs: List<SongEntity>, startIndex: Int = 0) {
         if (songs.isEmpty()) {
             originalQueue = emptyList()
@@ -57,10 +53,6 @@ class QueueManager {
         }
     }
 
-    /**
-     * Toggles shuffle mode using Index Mapping.
-     * Keeps current song at mapped position 0 when enabled without mutating originalQueue.
-     */
     fun toggleShuffle(): Boolean {
         val newShuffleState = !_isShuffleEnabled.value
         _isShuffleEnabled.value = newShuffleState
@@ -82,9 +74,6 @@ class QueueManager {
         return newShuffleState
     }
 
-    /**
-     * Cycles repeat mode: OFF -> ALL -> ONE -> OFF.
-     */
     fun cycleRepeatMode(): RepeatMode {
         val nextMode = when (_repeatMode.value) {
             RepeatMode.OFF -> RepeatMode.ALL
@@ -95,9 +84,6 @@ class QueueManager {
         return nextMode
     }
 
-    /**
-     * Advances to the next song in the queue respecting RepeatMode and Shuffled Index Mapping.
-     */
     fun next(): SongEntity? {
         if (originalQueue.isEmpty() || shuffledIndices.isEmpty()) return null
 
@@ -123,9 +109,6 @@ class QueueManager {
         }
     }
 
-    /**
-     * Returns the previous song in the queue.
-     */
     fun previous(): SongEntity? {
         if (originalQueue.isEmpty() || shuffledIndices.isEmpty()) return null
 

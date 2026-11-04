@@ -7,42 +7,39 @@ import com.example.bitperfect.player.QueueManager
 import com.example.bitperfect.player.RepeatMode
 import kotlinx.coroutines.flow.StateFlow
 
-class QueueViewModel(
-    application: Application,
-    val queueManager: QueueManager = QueueManager()
-) : AndroidViewModel(application) {
+class QueueViewModel(application: Application) : AndroidViewModel(application) {
 
-    val currentQueue: StateFlow<List<SongEntity>> = queueManager.currentQueue
-    val currentIndex: StateFlow<Int> = queueManager.currentIndex
-    val currentSong: StateFlow<SongEntity?> = queueManager.currentSong
-    val isShuffleEnabled: StateFlow<Boolean> = queueManager.isShuffleEnabled
-    val repeatMode: StateFlow<RepeatMode> = queueManager.repeatMode
+    val currentQueue: StateFlow<List<SongEntity>> = QueueManager.currentQueue
+    val currentIndex: StateFlow<Int> = QueueManager.currentIndex
+    val currentSong: StateFlow<SongEntity?> = QueueManager.currentSong
+    val isShuffleEnabled: StateFlow<Boolean> = QueueManager.isShuffleEnabled
+    val repeatMode: StateFlow<RepeatMode> = QueueManager.repeatMode
 
     fun setQueue(songs: List<SongEntity>, startIndex: Int = 0) {
-        queueManager.setQueue(songs, startIndex)
+        QueueManager.setQueue(songs, startIndex)
     }
 
     fun toggleShuffle(): Boolean {
-        return queueManager.toggleShuffle()
+        return QueueManager.toggleShuffle()
     }
 
     fun cycleRepeatMode(): RepeatMode {
-        return queueManager.cycleRepeatMode()
+        return QueueManager.cycleRepeatMode()
     }
 
     fun next(): SongEntity? {
-        return queueManager.next()
+        return QueueManager.next()
     }
 
     fun previous(): SongEntity? {
-        return queueManager.previous()
+        return QueueManager.previous()
     }
 
     fun removeAt(index: Int) {
-        queueManager.removeAt(index)
+        QueueManager.removeAt(index)
     }
 
     fun clearQueue() {
-        queueManager.clearQueue()
+        QueueManager.clearQueue()
     }
 }

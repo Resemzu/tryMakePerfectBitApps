@@ -100,7 +100,7 @@ class MainActivity : ComponentActivity() {
         val savedUri = getSavedFolderUri()
         if (savedUri != null) {
             val hasPermission = contentResolver.persistedUriPermissions.any { permission ->
-                permission.uri == savedUri && permission.isReadPermission
+                permission.uri.toString() == savedUri.toString() && permission.isReadPermission
             }
             if (hasPermission) {
                 viewModel.scanFolder(this, savedUri)
@@ -124,12 +124,23 @@ class MainActivity : ComponentActivity() {
     private fun requestRequiredPermissions() {
         val permissions = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            if (checkSelfPermission(Manifest.permission.READ_MEDIA_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
+            }
+            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
         } else {
-            permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
         }
-        permissionLauncher.launch(permissions.toTypedArray())
+
+        if (permissions.isNotEmpty()) {
+            permissionLauncher.launch(permissions.toTypedArray())
+        } else {
+            checkAndLoadSavedFolder()
+        }
     }
 }
 
@@ -195,41 +206,12 @@ fun MainScreen(
             containerColor = MaterialTheme.colorScheme.surface,
             contentColor = MaterialTheme.colorScheme.primary
         ) {
-            Tab(
-                selected = selectedTab == 0,
-                onClick = {
-                    selectedTab = 0
-                },
-                text = { Text("Now Playing") },
-                icon = { Icon(Icons.Default.MusicNote, contentDescription = null) }
-            )
-            Tab(
-                selected = selectedTab == 1,
-                onClick = {
-                    selectedTab = 1
-                },
-                text = { Text("Queue") },
-                icon = { Icon(Icons.AutoMirrored.Filled.QueueMusic, contentDescription = null) }
-            )
-            Tab(
-                selected = selectedTab == 2,
-                onClick = {
-                    selectedTab = 2
-                },
-                text = { Text("Playlists") },
-                icon = { Icon(Icons.Default.PlaylistPlay, contentDescription = null) }
-            )
-            Tab(
-                selected = selectedTab == 3,
-                onClick = {
-                    selectedTab = 3
-                },
-                text = { Text("Folders") },
-                icon = { Icon(Icons.Default.Folder, contentDescription = null) }
-            )
+            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Now Playing") }, icon = { Icon(Icons.Default.MusicNote, contentDescription = null) })
+            Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Queue") }, icon = { Icon(Icons.AutoMirrored.Filled.QueueMusic, contentDescription = null) })
+            Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("Playlists") }, icon = { Icon(Icons.Default.PlaylistPlay, contentDescription = null) })
+            Tab(selected = selectedTab == 3, onClick = { selectedTab = 3 }, text = { Text("Folders") }, icon = { Icon(Icons.Default.Folder, contentDescription = null) })
         }
 
-        // Body Content
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when (selectedTab) {
                 0 -> NowPlayingTab(viewModel = viewModel)
@@ -237,10 +219,7 @@ fun MainScreen(
                 2 -> {
                     val currentPlaylistId = activePlaylistId
                     if (currentPlaylistId == null) {
-                        PlaylistsScreen(
-                            playlistViewModel = playlistViewModel,
-                            onPlaylistClick = { id -> activePlaylistId = id }
-                        )
+                        PlaylistsScreen(playlistViewModel = playlistViewModel, onPlaylistClick = { id -> activePlaylistId = id })
                     } else {
                         PlaylistDetailScreen(
                             playlistId = currentPlaylistId,
@@ -283,14 +262,12 @@ fun NowPlayingTab(viewModel: AudioViewModel) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // Bit-Perfect & USB DAC Dynamic Status Chip
         BitPerfectStatusChip(
             status = bitPerfectStatus,
             dacFormatInfo = dacFormatInfo,
             modifier = Modifier.padding(top = 4.dp)
         )
 
-        // Cover Art Card
         Card(
             modifier = Modifier
                 .size(240.dp)
@@ -321,7 +298,6 @@ fun NowPlayingTab(viewModel: AudioViewModel) {
             }
         }
 
-        // Metadata Info
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Text(
                 text = song?.title ?: "No Track Selected",
@@ -337,17 +313,8 @@ fun NowPlayingTab(viewModel: AudioViewModel) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 14.sp
             )
-            if (song != null) {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = "Played ${song.playCount} times • Folder: ${song.folderName}",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 12.sp
-                )
-            }
         }
 
-        // Seek Bar & Timers
         Column(modifier = Modifier.fillMaxWidth()) {
             Slider(
                 value = if (isDragging) sliderPosition else currentPos.toFloat(),
@@ -357,7 +324,7 @@ fun NowPlayingTab(viewModel: AudioViewModel) {
                 },
                 onValueChangeFinished = {
                     isDragging = false
-                    viewModel.onSeek(sliderPosition.toLong())
+                    viewModel.onSeek(context, sliderPosition.toLong())
                 },
                 valueRange = 0f..duration.coerceAtLeast(1L).toFloat(),
                 colors = SliderDefaults.colors(
@@ -383,7 +350,6 @@ fun NowPlayingTab(viewModel: AudioViewModel) {
             }
         }
 
-        // Controls Row with Smart Shuffle & Cycle Repeat Controls
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -391,7 +357,6 @@ fun NowPlayingTab(viewModel: AudioViewModel) {
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Smart Shuffle Toggle
             IconButton(onClick = { viewModel.toggleShuffle() }) {
                 Icon(
                     imageVector = Icons.Default.Shuffle,
@@ -399,59 +364,26 @@ fun NowPlayingTab(viewModel: AudioViewModel) {
                     tint = if (isShuffle) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-
-            // Previous
-            IconButton(
-                onClick = { viewModel.playPrevious(context) },
-                modifier = Modifier.size(48.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.SkipPrevious,
-                    contentDescription = "Previous Track",
-                    tint = MaterialTheme.colorScheme.onBackground,
-                    modifier = Modifier.size(36.dp)
-                )
+            IconButton(onClick = { viewModel.playPrevious(context) }, modifier = Modifier.size(48.dp)) {
+                Icon(imageVector = Icons.Default.SkipPrevious, contentDescription = "Previous Track", tint = MaterialTheme.colorScheme.onBackground, modifier = Modifier.size(36.dp))
             }
-
-            // Play / Pause Toggle
             FilledIconButton(
-                onClick = { viewModel.togglePlayPause() },
+                onClick = { viewModel.togglePlayPause(context) },
                 modifier = Modifier.size(64.dp),
                 colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary)
             ) {
-                Icon(
-                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                    contentDescription = if (isPlaying) "Pause" else "Play",
-                    tint = Color.Black,
-                    modifier = Modifier.size(36.dp)
-                )
+                Icon(imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = if (isPlaying) "Pause" else "Play", tint = Color.Black, modifier = Modifier.size(36.dp))
             }
-
-            // Next
-            IconButton(
-                onClick = { viewModel.playNext(context) },
-                modifier = Modifier.size(48.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.SkipNext,
-                    contentDescription = "Next Track",
-                    tint = MaterialTheme.colorScheme.onBackground,
-                    modifier = Modifier.size(36.dp)
-                )
+            IconButton(onClick = { viewModel.playNext(context) }, modifier = Modifier.size(48.dp)) {
+                Icon(imageVector = Icons.Default.SkipNext, contentDescription = "Next Track", tint = MaterialTheme.colorScheme.onBackground, modifier = Modifier.size(36.dp))
             }
-
-            // Cycle Repeat Mode Toggle (OFF -> ALL -> ONE -> OFF)
             IconButton(onClick = { viewModel.cycleRepeatMode() }) {
                 val (repeatIcon, repeatTint) = when (repeatMode) {
                     RepeatMode.OFF -> Pair(Icons.Default.Repeat, MaterialTheme.colorScheme.onSurfaceVariant)
                     RepeatMode.ALL -> Pair(Icons.Default.Repeat, MaterialTheme.colorScheme.primary)
                     RepeatMode.ONE -> Pair(Icons.Default.RepeatOne, MaterialTheme.colorScheme.primary)
                 }
-                Icon(
-                    imageVector = repeatIcon,
-                    contentDescription = "Repeat Mode ($repeatMode)",
-                    tint = repeatTint
-                )
+                Icon(imageVector = repeatIcon, contentDescription = "Repeat Mode ($repeatMode)", tint = repeatTint)
             }
         }
     }
@@ -476,13 +408,8 @@ fun QueueTab(viewModel: AudioViewModel) {
                 fontWeight = FontWeight.Bold
             )
             if (currentQueue.isNotEmpty()) {
-                TextButton(onClick = { viewModel.clearQueue() }) {
-                    Icon(
-                        imageVector = Icons.Default.Delete,
-                        contentDescription = null,
-                        tint = Color(0xFFFF6B6B),
-                        modifier = Modifier.size(18.dp)
-                    )
+                TextButton(onClick = { viewModel.clearQueue(context) }) {
+                    Icon(imageVector = Icons.Default.Delete, contentDescription = null, tint = Color(0xFFFF6B6B), modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Clear", color = Color(0xFFFF6B6B))
                 }
@@ -490,15 +417,8 @@ fun QueueTab(viewModel: AudioViewModel) {
         }
 
         if (currentQueue.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "Queue is empty. Select a folder or playlist to load tracks.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 14.sp
-                )
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Queue is empty. Select a folder or playlist to load tracks.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
             }
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -508,43 +428,17 @@ fun QueueTab(viewModel: AudioViewModel) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable { viewModel.playSongAtIndex(context, index) },
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (isCurrent) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
-                        ),
+                        colors = CardDefaults.cardColors(containerColor = if (isCurrent) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "${index + 1}",
-                                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 14.sp,
-                                modifier = Modifier.width(28.dp)
-                            )
+                        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("${index + 1}", color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp, modifier = Modifier.width(28.dp))
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = song.title,
-                                    color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground,
-                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
-                                    fontSize = 15.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = "${song.artist} • Play count: ${song.playCount}",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    fontSize = 12.sp
-                                )
+                                Text(song.title, color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onBackground, fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text("${song.artist} • Play count: ${song.playCount}", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
                             }
                             IconButton(onClick = { viewModel.removeTrackAt(index) }) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Remove",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(20.dp)
-                                )
+                                Icon(Icons.Default.Close, contentDescription = "Remove", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
                             }
                         }
                     }
@@ -569,11 +463,7 @@ fun FolderTab(viewModel: AudioViewModel, onOpenFolderClick: () -> Unit) {
             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
             shape = RoundedCornerShape(12.dp)
         ) {
-            Icon(
-                imageVector = Icons.Default.FolderOpen,
-                contentDescription = null,
-                tint = Color.Black
-            )
+            Icon(Icons.Default.FolderOpen, contentDescription = null, tint = Color.Black)
             Spacer(modifier = Modifier.width(8.dp))
             Text("Select Music Folder", color = Color.Black, fontWeight = FontWeight.Bold)
         }
@@ -581,15 +471,8 @@ fun FolderTab(viewModel: AudioViewModel, onOpenFolderClick: () -> Unit) {
         Spacer(modifier = Modifier.height(16.dp))
 
         if (folderList.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "No folders scanned yet.\nTap 'Select Music Folder' to pick a music directory.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 14.sp
-                )
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("No folders scanned yet.\nTap 'Select Music Folder' to pick a music directory.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 14.sp)
             }
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -606,25 +489,11 @@ fun FolderTab(viewModel: AudioViewModel, onOpenFolderClick: () -> Unit) {
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Default.Folder,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(28.dp)
-                                    )
+                                    Icon(Icons.Default.Folder, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(28.dp))
                                     Spacer(modifier = Modifier.width(12.dp))
                                     Column {
-                                        Text(
-                                            text = folder.name,
-                                            color = MaterialTheme.colorScheme.onBackground,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 16.sp
-                                        )
-                                        Text(
-                                            text = "${folder.trackCount} tracks",
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            fontSize = 12.sp
-                                        )
+                                        Text(folder.name, color = MaterialTheme.colorScheme.onBackground, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                                        Text("${folder.trackCount} tracks", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
                                     }
                                 }
                                 Button(
@@ -632,12 +501,7 @@ fun FolderTab(viewModel: AudioViewModel, onOpenFolderClick: () -> Unit) {
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                                 ) {
-                                    Icon(
-                                        imageVector = Icons.Default.PlayArrow,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(16.dp)
-                                    )
+                                    Icon(Icons.Default.PlayArrow, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text("Play Folder", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
                                 }
@@ -647,43 +511,23 @@ fun FolderTab(viewModel: AudioViewModel, onOpenFolderClick: () -> Unit) {
 
                             folder.tracks.take(5).forEach { song ->
                                 Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Row(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .clickable { viewModel.playSong(context, song) },
+                                        modifier = Modifier.weight(1f).clickable { viewModel.playSong(context, song) },
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Audiotrack,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(16.dp)
-                                        )
+                                        Icon(Icons.Default.Audiotrack, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
                                         Spacer(modifier = Modifier.width(8.dp))
-                                        Text(
-                                            text = song.title,
-                                            color = MaterialTheme.colorScheme.onBackground,
-                                            fontSize = 13.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
+                                        Text(song.title, color = MaterialTheme.colorScheme.onBackground, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                     IconButton(
                                         onClick = { selectedSongForPlaylist = song },
                                         modifier = Modifier.size(24.dp)
                                     ) {
-                                        Icon(
-                                            imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
-                                            contentDescription = "Add to playlist",
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(18.dp)
-                                        )
+                                        Icon(Icons.AutoMirrored.Filled.PlaylistAdd, contentDescription = "Add to playlist", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
                                     }
                                 }
                             }
@@ -691,44 +535,6 @@ fun FolderTab(viewModel: AudioViewModel, onOpenFolderClick: () -> Unit) {
                     }
                 }
             }
-        }
-
-        // Dialog for adding single song to playlist
-        if (selectedSongForPlaylist != null) {
-            AlertDialog(
-                onDismissRequest = { selectedSongForPlaylist = null },
-                title = { Text("Add to Playlist") },
-                text = {
-                    if (allPlaylists.isEmpty()) {
-                        Text("No playlists available. Please create a playlist first in the Playlists tab.")
-                    } else {
-                        LazyColumn {
-                            itemsIndexed(allPlaylists) { _, playlist ->
-                                Text(
-                                    text = playlist.name,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable {
-                                            selectedSongForPlaylist?.let { song ->
-                                                viewModel.addSongsToPlaylist(playlist.id, listOf(song.id))
-                                            }
-                                            selectedSongForPlaylist = null
-                                        }
-                                        .padding(vertical = 12.dp),
-                                    fontSize = 16.sp,
-                                    color = MaterialTheme.colorScheme.onBackground
-                                )
-                            }
-                        }
-                    }
-                },
-                confirmButton = {},
-                dismissButton = {
-                    TextButton(onClick = { selectedSongForPlaylist = null }) {
-                        Text("Close")
-                    }
-                }
-            )
         }
     }
 }

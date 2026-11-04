@@ -3,10 +3,11 @@ package com.example.bitperfect
 import android.app.Application
 import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.os.SystemClock
+import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
@@ -20,12 +21,11 @@ import com.example.bitperfect.data.db.PlaylistEntity
 import com.example.bitperfect.data.db.PlaylistSongCrossRef
 import com.example.bitperfect.data.db.PlaylistWithSongs
 import com.example.bitperfect.data.db.SongEntity
+import com.example.bitperfect.notification.MusicNotificationManager
 import com.example.bitperfect.player.QueueManager
 import com.example.bitperfect.player.RepeatMode
 import com.example.bitperfect.util.AudioMetadataExtractor
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -43,9 +43,6 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
     private val dao = database.playlistDao()
 
     val usbDacDetector = UsbDacDetector(application)
-    val queueManager = QueueManager()
-    private val nativeEngine = NativeAudioEngine()
-    private var decoder: AudioDecoder? = null
 
     // Room Database Flows
     val allPlaylists: StateFlow<List<PlaylistEntity>> = dao.getAllPlaylists()
@@ -54,12 +51,16 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
     val dbSongs: StateFlow<List<SongEntity>> = dao.getAllSongs()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // Queue Flows exposed from QueueManager
-    val currentQueue: StateFlow<List<SongEntity>> = queueManager.currentQueue
-    val currentTrackIndex: StateFlow<Int> = queueManager.currentIndex
-    val currentSong: StateFlow<SongEntity?> = queueManager.currentSong
-    val isShuffleEnabled: StateFlow<Boolean> = queueManager.isShuffleEnabled
-    val repeatMode: StateFlow<RepeatMode> = queueManager.repeatMode
+    // Queue Flows exposed directly from Global QueueManager
+    val currentQueue: StateFlow<List<SongEntity>> = QueueManager.currentQueue
+    val currentTrackIndex: StateFlow<Int> = QueueManager.currentIndex
+    val currentSong: StateFlow<SongEntity?> = QueueManager.currentSong
+    val isShuffleEnabled: StateFlow<Boolean> = QueueManager.isShuffleEnabled
+    val repeatMode: StateFlow<RepeatMode> = QueueManager.repeatMode
+
+    // Playback States from AudioService
+    val isPlaying: StateFlow<Boolean> = AudioService.isPlayingState
+    val currentPosition: StateFlow<Long> = AudioService.currentPositionState
 
     // USB DAC & Bit-Perfect Status
     val isUsbDacConnected: StateFlow<Boolean> = usbDacDetector.isUsbDacConnected
@@ -67,12 +68,6 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _bitPerfectStatus = MutableStateFlow(BitPerfectStatus.DISABLED_INTERNAL)
     val bitPerfectStatus: StateFlow<BitPerfectStatus> = _bitPerfectStatus.asStateFlow()
-
-    private val _isPlaying = MutableStateFlow(false)
-    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
-
-    private val _currentPosition = MutableStateFlow(0L)
-    val currentPosition: StateFlow<Long> = _currentPosition.asStateFlow()
 
     private val _folderList = MutableStateFlow<List<FolderNode>>(emptyList())
     val folderList: StateFlow<List<FolderNode>> = _folderList.asStateFlow()
@@ -83,22 +78,16 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
     private val _currentCoverBitmap = MutableStateFlow<Bitmap?>(null)
     val currentCoverBitmap: StateFlow<Bitmap?> = _currentCoverBitmap.asStateFlow()
 
-    private var pollingJob: Job? = null
-    private var lastUiUpdateMs = 0L
-
     init {
-        initAudioEngine()
-        // Automatically trigger MediaStore Delta Sync on startup
         scanMediaStore(application)
 
-        // Observe USB DAC connection & engine state
         viewModelScope.launch {
             usbDacDetector.isUsbDacConnected.collect {
-                updateBitPerfectStatus()
+                // Biarkan service yang update status utamanya, tapi kita bisa sync UI.
             }
         }
         viewModelScope.launch {
-            queueManager.currentSong.collect { song ->
+            QueueManager.currentSong.collect { song ->
                 if (song != null) {
                     loadCoverBitmap(song)
                 } else {
@@ -108,22 +97,19 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun initAudioEngine() {
-        try {
-            nativeEngine.initAudioEngine()
-            updateBitPerfectStatus()
-        } catch (e: Exception) {
-            e.printStackTrace()
+    private fun sendCommandToService(context: Context, action: String, extraPos: Long? = null) {
+        val intent = Intent(context, AudioService::class.java).apply {
+            this.action = action
+            if (extraPos != null) putExtra("SEEK_POS", extraPos)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
         }
     }
 
-    fun updateBitPerfectStatus() {
-        val isExclusive = try { nativeEngine.isBitPerfectMode() } catch (e: Exception) { false }
-        val newStatus = usbDacDetector.evaluateBitPerfectStatus(isExclusive)
-        _bitPerfectStatus.value = newStatus
-    }
-
-    // --- MEDIASTORE BACKGROUND SCANNING & DELTA SYNC ---
+    // --- MEDIASTORE BACKGROUND SCANNING ---
 
     fun scanMediaStore(context: Context) {
         viewModelScope.launch {
@@ -204,123 +190,82 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- THROTTLED UI POSITION POLLING ---
-
-    private fun startThrottledPositionPolling() {
-        pollingJob?.cancel()
-        pollingJob = viewModelScope.launch(Dispatchers.Default) {
-            while (_isPlaying.value) {
-                val now = SystemClock.uptimeMillis()
-                if (now - lastUiUpdateMs >= 50) {
-                    lastUiUpdateMs = now
-                    val pos = nativeEngine.getNativePlaybackPositionMs()
-                    _currentPosition.value = pos
-                }
-                delay(50)
-            }
-        }
-    }
-
-    private fun stopThrottledPositionPolling() {
-        pollingJob?.cancel()
-        pollingJob = null
-    }
-
     // --- PLAYBACK & QUEUE CONTROLS ---
 
     fun playSongAtIndex(context: Context, index: Int) {
         val list = currentQueue.value
         if (index < 0 || index >= list.size) return
 
-        queueManager.setQueue(list, index)
-        val song = list[index]
-        playSong(context, song)
+        QueueManager.setQueue(list, index)
+        sendCommandToService(context, "ACTION_PLAY_NEW")
     }
 
     fun playSong(context: Context, song: SongEntity) {
-        if (decoder == null) {
-            decoder = AudioDecoder(context.applicationContext)
-        }
-
-        nativeEngine.stop()
-
-        val uri = Uri.parse(song.contentUri)
-        val fdOpened = decoder?.openFileDescriptorAndSendToNative(uri, nativeEngine) { _, _, _ ->
-            // Duration update if needed
-        } ?: false
-
-        if (!fdOpened) {
-            nativeEngine.loadTrack(song.contentUri)
-        }
-
-        nativeEngine.play()
-        updateBitPerfectStatus()
-
-        _isPlaying.value = true
-        _currentPosition.value = 0L
-        lastUiUpdateMs = 0L
-        startThrottledPositionPolling()
+        val currentList = currentQueue.value
+        val index = currentList.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
+        QueueManager.setQueue(if (currentList.isEmpty()) listOf(song) else currentList, index)
+        sendCommandToService(context, "ACTION_PLAY_NEW")
     }
 
-    fun togglePlayPause() {
-        val song = currentSong.value
-        if (song == null) {
-            val list = currentQueue.value
-            if (list.isNotEmpty()) {
-                playSongAtIndex(getApplication(), 0)
-            }
-            return
-        }
-
-        if (_isPlaying.value) {
-            nativeEngine.pause()
-            _isPlaying.value = false
-            stopThrottledPositionPolling()
+    fun togglePlayPause(context: Context) {
+        if (isPlaying.value) {
+            sendCommandToService(context, MusicNotificationManager.ACTION_PAUSE)
         } else {
-            nativeEngine.play()
-            _isPlaying.value = true
-            updateBitPerfectStatus()
-            startThrottledPositionPolling()
+            val song = currentSong.value
+            if (song == null && currentQueue.value.isNotEmpty()) {
+                playSongAtIndex(context, 0)
+            } else {
+                sendCommandToService(context, MusicNotificationManager.ACTION_PLAY)
+            }
         }
     }
 
     fun playNext(context: Context) {
-        val nextSong = queueManager.next() ?: return
-        playSong(context, nextSong)
+        sendCommandToService(context, MusicNotificationManager.ACTION_NEXT)
     }
 
     fun playPrevious(context: Context) {
-        val prevSong = queueManager.previous() ?: return
-        playSong(context, prevSong)
+        sendCommandToService(context, MusicNotificationManager.ACTION_PREVIOUS)
     }
 
     fun toggleShuffle() {
-        queueManager.toggleShuffle()
+        QueueManager.toggleShuffle()
     }
 
     fun cycleRepeatMode(): RepeatMode {
-        return queueManager.cycleRepeatMode()
+        return QueueManager.cycleRepeatMode()
     }
 
-    fun stopAudio() {
-        nativeEngine.stop()
-        _isPlaying.value = false
-        _currentPosition.value = 0L
-        stopThrottledPositionPolling()
+    fun stopAudio(context: Context) {
+        sendCommandToService(context, MusicNotificationManager.ACTION_STOP)
     }
 
-    fun onSeek(positionMs: Long) {
-        _currentPosition.value = positionMs
-        nativeEngine.seekTo(positionMs)
+    fun onSeek(context: Context, positionMs: Long) {
+        sendCommandToService(context, "ACTION_SEEK", positionMs)
     }
 
-    fun reinitializeStream(forceFallback: Boolean) {
-        nativeEngine.reinitializeStream(forceFallback)
-        updateBitPerfectStatus()
+    fun playPlaylist(context: Context, songs: List<SongEntity>, startIndex: Int = 0) {
+        if (songs.isEmpty()) return
+        QueueManager.setQueue(songs, startIndex)
+        sendCommandToService(context, "ACTION_PLAY_NEW")
     }
 
-    // --- ROOM PLAYLIST & SONG OPERATIONS ---
+    fun playFolder(context: Context, folderNode: FolderNode) {
+        if (folderNode.tracks.isNotEmpty()) {
+            playPlaylist(context, folderNode.tracks, 0)
+        }
+    }
 
+    fun removeTrackAt(index: Int) {
+        QueueManager.removeAt(index)
+    }
+
+    fun clearQueue(context: Context) {
+        stopAudio(context)
+        QueueManager.clearQueue()
+    }
+
+    // --- ROOM PLAYLIST OPERATIONS ---
     fun createPlaylist(name: String) {
         if (name.isBlank()) return
         viewModelScope.launch(Dispatchers.IO) {
@@ -354,21 +299,6 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         return dao.getPlaylistWithSongs(playlistId)
     }
 
-    fun playPlaylist(context: Context, songs: List<SongEntity>, startIndex: Int = 0) {
-        if (songs.isEmpty()) return
-        queueManager.setQueue(songs, startIndex)
-        playSong(context, songs[startIndex.coerceIn(0, songs.size - 1)])
-    }
-
-    fun onSongFinished(songId: Long) {
-        viewModelScope.launch(Dispatchers.IO) {
-            dao.updatePlayStats(songId)
-            withContext(Dispatchers.Main) {
-                playNext(getApplication())
-            }
-        }
-    }
-
     // --- FOLDER SCANNING & NAVIGATION ---
 
     fun scanFolder(context: Context, treeUri: Uri) {
@@ -383,7 +313,7 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) {
                     dao.insertSongs(allTracks)
                 }
-                queueManager.setQueue(allTracks, 0)
+                QueueManager.setQueue(allTracks, 0)
             }
             _isScanning.value = false
         }
@@ -412,20 +342,14 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
                             val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                             durationMs = durStr?.toLongOrNull() ?: 0L
                             val metaTitle = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
-                            if (!metaTitle.isNullOrEmpty()) {
-                                trackTitle = metaTitle
-                            }
+                            if (!metaTitle.isNullOrEmpty()) trackTitle = metaTitle
                             val metaArtist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
-                            if (!metaArtist.isNullOrEmpty()) {
-                                trackArtist = metaArtist
-                            }
+                            if (!metaArtist.isNullOrEmpty()) trackArtist = metaArtist
                             val metaAlbum = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
-                            if (!metaAlbum.isNullOrEmpty()) {
-                                trackAlbum = metaAlbum
-                            }
+                            if (!metaAlbum.isNullOrEmpty()) trackAlbum = metaAlbum
                         }
                     } catch (e: Exception) {
-                        Log.w("AudioViewModel", "Error reading metadata for ${file.name}", e)
+                        Log.w("AudioViewModel", "Error reading metadata", e)
                     }
 
                     val song = SongEntity(
@@ -455,11 +379,7 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         try {
             traverseDirectory(folder, folder.name ?: "Selected Folder")
         } finally {
-            try {
-                retriever.release()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+            try { retriever.release() } catch (e: Exception) {}
         }
         return Pair(folderNodes, allTracks)
     }
@@ -479,24 +399,8 @@ class AudioViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun playFolder(context: Context, folderNode: FolderNode) {
-        if (folderNode.tracks.isNotEmpty()) {
-            playPlaylist(context, folderNode.tracks, 0)
-        }
-    }
-
-    fun removeTrackAt(index: Int) {
-        queueManager.removeAt(index)
-    }
-
-    fun clearQueue() {
-        stopAudio()
-        queueManager.clearQueue()
-    }
-
     override fun onCleared() {
         super.onCleared()
         usbDacDetector.unregisterCallback()
-        stopThrottledPositionPolling()
     }
 }

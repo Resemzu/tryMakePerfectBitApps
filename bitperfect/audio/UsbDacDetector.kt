@@ -1,6 +1,13 @@
 package com.example.bitperfect.audio
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
@@ -23,19 +30,24 @@ data class DacFormatInfo(
     val deviceName: String = "USB DAC"
 )
 
-class UsbDacDetector(context: Context) {
+class UsbDacDetector(private val context: Context) {
 
     companion object {
-        private const val TAG = "UsbDacDetector"
+        private const val TAG = "BitPerfectEngine"
+        const val ACTION_USB_PERMISSION = "com.example.bitperfect.ACTION_USB_PERMISSION"
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
 
     private val _isUsbDacConnected = MutableStateFlow(false)
     val isUsbDacConnected: StateFlow<Boolean> = _isUsbDacConnected.asStateFlow()
 
     private val _dacFormatInfo = MutableStateFlow(DacFormatInfo())
     val dacFormatInfo: StateFlow<DacFormatInfo> = _dacFormatInfo.asStateFlow()
+
+    private val _directUsbFd = MutableStateFlow(-1)
+    val directUsbFd: StateFlow<Int> = _directUsbFd.asStateFlow()
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
@@ -47,9 +59,34 @@ class UsbDacDetector(context: Context) {
         }
     }
 
+    private val usbReceiver = object : BroadcastReceiver() {
+        override fun onReceive(cntx: Context?, intent: Intent?) {
+            if (intent?.action == ACTION_USB_PERMISSION) {
+                synchronized(this) {
+                    val device: UsbDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                    if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
+                        device?.let {
+                            Log.d(TAG, "USB Permission Granted for Direct Pass-Through: ${it.productName}")
+                            openDirectUsbConnection(it)
+                        }
+                    } else {
+                        Log.w(TAG, "USB Permission Denied for Direct Pass-Through: ${device?.productName}")
+                    }
+                }
+            }
+        }
+    }
+
     init {
         registerCallback()
+        registerUsbReceiver()
         checkUsbDacDevices()
+        checkUsbHostDevices()
     }
 
     fun registerCallback() {
@@ -57,7 +94,21 @@ class UsbDacDetector(context: Context) {
     }
 
     fun unregisterCallback() {
-        audioManager.unregisterAudioDeviceCallback(deviceCallback)
+        try {
+            audioManager.unregisterAudioDeviceCallback(deviceCallback)
+            context.unregisterReceiver(usbReceiver)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun registerUsbReceiver() {
+        val filter = IntentFilter(ACTION_USB_PERMISSION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(usbReceiver, filter)
+        }
     }
 
     fun checkUsbDacDevices() {
@@ -75,6 +126,7 @@ class UsbDacDetector(context: Context) {
             ) {
                 usbDacFound = true
                 deviceName = device.productName?.toString() ?: "USB DAC"
+                Log.d(TAG, "Audio device attached: $deviceName, Type: $type")
 
                 val sampleRates = device.sampleRates
                 if (sampleRates.isNotEmpty()) {
@@ -101,7 +153,48 @@ class UsbDacDetector(context: Context) {
             bitDepth = bitDepth,
             deviceName = deviceName
         )
-        Log.i(TAG, "USB DAC Detected: $usbDacFound ($deviceName - ${bitDepth}bit/${sampleRate}Hz)")
+    }
+
+    fun checkUsbHostDevices() {
+        val deviceList = usbManager.deviceList
+        for (device in deviceList.values) {
+            if (isUsbAudioDevice(device)) {
+                Log.d(TAG, "USB Audio Device detected in Host mode: ${device.productName}")
+                if (!usbManager.hasPermission(device)) {
+                    val permissionIntent = PendingIntent.getBroadcast(
+                        context,
+                        0,
+                        Intent(ACTION_USB_PERMISSION),
+                        PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                    )
+                    usbManager.requestPermission(device, permissionIntent)
+                } else {
+                    openDirectUsbConnection(device)
+                }
+            }
+        }
+    }
+
+    private fun isUsbAudioDevice(device: UsbDevice): Boolean {
+        if (device.deviceClass == UsbConstants.USB_CLASS_AUDIO) return true
+        for (i in 0 until device.interfaceCount) {
+            val iface = device.getInterface(i)
+            if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO) return true
+        }
+        return false
+    }
+
+    private fun openDirectUsbConnection(device: UsbDevice) {
+        try {
+            val connection = usbManager.openDevice(device)
+            if (connection != null) {
+                val fd = connection.fileDescriptor
+                _directUsbFd.value = fd
+                Log.d(TAG, "Direct USB File Descriptor obtained for Bit-Perfect Bypass: FD=$fd")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open direct USB connection: ${e.message}")
+        }
     }
 
     fun evaluateBitPerfectStatus(isExclusiveMode: Boolean): BitPerfectStatus {

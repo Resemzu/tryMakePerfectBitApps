@@ -26,8 +26,10 @@ import com.example.bitperfect.player.QueueManager
 import com.example.bitperfect.util.AudioMetadataExtractor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -39,11 +41,15 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
     companion object {
         private const val TAG = "AudioService"
         private const val WAKE_LOCK_TAG = "BitPerfect::AudioPlaybackWakeLock"
+
+        // State global untuk dibaca oleh UI
+        val isPlayingState = MutableStateFlow(false)
+        val currentPositionState = MutableStateFlow(0L)
     }
 
     private val binder = LocalBinder()
     val nativeEngine = NativeAudioEngine()
-    val queueManager = QueueManager()
+
     lateinit var usbDacDetector: UsbDacDetector
         private set
 
@@ -55,6 +61,7 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var audioFocusRequest: AudioFocusRequest? = null
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var pollingJob: Job? = null
 
     private val _currentCoverBitmap = MutableStateFlow<Bitmap?>(null)
     val currentCoverBitmap: StateFlow<Bitmap?> = _currentCoverBitmap.asStateFlow()
@@ -127,7 +134,7 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
         }
         serviceScope.launch {
-            queueManager.currentSong.collect { song ->
+            QueueManager.currentSong.collect { song ->
                 if (song != null) {
                     loadCoverAndNotify(song)
                 } else {
@@ -137,14 +144,10 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    /**
-     * JNI Callback invoked directly from Native C++ audio thread when track reaches End-Of-Stream (EOS).
-     * Handles background Auto-Next completely independent of MainActivity lifecycle!
-     */
     fun onEosReached() {
         Log.i(TAG, "JNI EOS Callback received in AudioService! Executing Auto-Next in background...")
         serviceScope.launch(Dispatchers.Main) {
-            val currentSong = queueManager.currentSong.value
+            val currentSong = QueueManager.currentSong.value
             if (currentSong != null) {
                 withContext(Dispatchers.IO) {
                     database.playlistDao().updatePlayStats(currentSong.id)
@@ -154,9 +157,6 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    /**
-     * Alias method for JNI callback if called via onNativeTrackEnded
-     */
     fun onNativeTrackEnded() {
         onEosReached()
     }
@@ -167,6 +167,21 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
         _bitPerfectStatus.value = newStatus
     }
 
+    private fun startThrottledPositionPolling() {
+        pollingJob?.cancel()
+        pollingJob = serviceScope.launch(Dispatchers.Default) {
+            while (isPlaying) {
+                currentPositionState.value = nativeEngine.getNativePlaybackPositionMs()
+                delay(50)
+            }
+        }
+    }
+
+    private fun stopThrottledPositionPolling() {
+        pollingJob?.cancel()
+        pollingJob = null
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             MusicNotificationManager.ACTION_PLAY -> resumePlayback()
@@ -174,9 +189,17 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
             MusicNotificationManager.ACTION_NEXT -> playNextSong()
             MusicNotificationManager.ACTION_PREVIOUS -> playPreviousSong()
             MusicNotificationManager.ACTION_STOP -> stopPlayback()
+            "ACTION_PLAY_NEW" -> {
+                QueueManager.currentSong.value?.let { playSong(it) }
+            }
+            "ACTION_SEEK" -> {
+                val pos = intent.getLongExtra("SEEK_POS", 0L)
+                nativeEngine.seekTo(pos)
+                currentPositionState.value = pos
+            }
         }
         val notification = notificationManager.createNotification(
-            song = queueManager.currentSong.value,
+            song = QueueManager.currentSong.value,
             isPlaying = isPlaying,
             coverBitmap = _currentCoverBitmap.value
         )
@@ -185,8 +208,6 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
-
-    // --- Audio Focus Management ---
 
     fun requestAudioFocus(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -237,8 +258,6 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    // --- Playback Controls & WakeLock Management ---
-
     fun playSong(song: SongEntity): Boolean {
         if (!requestAudioFocus()) return false
         nativeEngine.stop()
@@ -254,15 +273,17 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
         val success = nativeEngine.play()
         if (success) {
             isPlaying = true
+            isPlayingState.value = true
             acquireWakeLock()
             updateBitPerfectStatus()
             loadCoverAndNotify(song)
+            startThrottledPositionPolling()
         }
         return success
     }
 
     fun playNextSong(): Boolean {
-        val nextSong = queueManager.next() ?: run {
+        val nextSong = QueueManager.next() ?: run {
             stopPlayback()
             return false
         }
@@ -270,7 +291,7 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     fun playPreviousSong(): Boolean {
-        val prevSong = queueManager.previous() ?: return false
+        val prevSong = QueueManager.previous() ?: return false
         return playSong(prevSong)
     }
 
@@ -279,9 +300,11 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
         val success = nativeEngine.play()
         if (success) {
             isPlaying = true
+            isPlayingState.value = true
             acquireWakeLock()
             updateBitPerfectStatus()
-            notificationManager.updateNotification(queueManager.currentSong.value, isPlaying = true, coverBitmap = _currentCoverBitmap.value)
+            notificationManager.updateNotification(QueueManager.currentSong.value, isPlaying = true, coverBitmap = _currentCoverBitmap.value)
+            startThrottledPositionPolling()
         }
         return success
     }
@@ -289,26 +312,30 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
     fun pausePlayback(): Boolean {
         val success = nativeEngine.pause()
         isPlaying = false
+        isPlayingState.value = false
         releaseWakeLock()
         abandonAudioFocus()
-        notificationManager.updateNotification(queueManager.currentSong.value, isPlaying = false, coverBitmap = _currentCoverBitmap.value)
+        notificationManager.updateNotification(QueueManager.currentSong.value, isPlaying = false, coverBitmap = _currentCoverBitmap.value)
+        stopThrottledPositionPolling()
         return success
     }
 
     fun stopPlayback(): Boolean {
         val success = nativeEngine.stop()
         isPlaying = false
+        isPlayingState.value = false
         releaseWakeLock()
         abandonAudioFocus()
         stopForeground(STOP_FOREGROUND_REMOVE)
         notificationManager.release()
+        stopThrottledPositionPolling()
         return success
     }
 
     private fun acquireWakeLock() {
         try {
             if (wakeLock?.isHeld == false) {
-                wakeLock?.acquire(10 * 60 * 1000L /* 10 mins safety timeout */)
+                wakeLock?.acquire(10 * 60 * 1000L)
                 Log.i(TAG, "Acquired PARTIAL_WAKE_LOCK for screen-off playback stability")
             }
         } catch (e: Exception) {
@@ -352,6 +379,7 @@ class AudioService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopThrottledPositionPolling()
         try {
             unregisterReceiver(noisyReceiver)
             unregisterReceiver(usbHotplugReceiver)
